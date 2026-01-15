@@ -1,87 +1,77 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 export DISPLAY=:99
 export NO_AT_BRIDGE=1
 export SESSION_MANAGER=""
-export DBUS_SESSION_BUS_ADDRESS=""
-export USER=user
+
+APP_USER=user
+APP_UID=1000
+APP_GID=1000
+
+export XDG_RUNTIME_DIR="/run/user/${APP_UID}"
+mkdir -p "${XDG_RUNTIME_DIR}"
+chown "${APP_UID}:${APP_GID}" "${XDG_RUNTIME_DIR}"
+chmod 700 "${XDG_RUNTIME_DIR}"
 
 echo "Starting Tailscale daemon..."
-sudo nohup tailscaled > /dev/null 2>&1 &
+nohup tailscaled >/dev/null 2>&1 &
 echo
 
 echo "Starting TigerVNC server on DISPLAY=$DISPLAY..."
 Xvnc -alwaysshared ${DISPLAY} -geometry 1920x1080 -depth 24 -rfbport 5900 -SecurityTypes None &
 sleep 2
 echo "TigerVNC server running on DISPLAY=$DISPLAY"
+echo
 
-echo "Starting DBus session"
-eval $(dbus-launch --sh-syntax)
-export SESSION_MANAGER=""
+echo "Starting DBus session (as ${APP_USER})..."
+export XDG_RUNTIME_DIR="/run/user/${APP_UID}"
+mkdir -p "${XDG_RUNTIME_DIR}"
+chown "${APP_UID}:${APP_GID}" "${XDG_RUNTIME_DIR}"
+chmod 700 "${XDG_RUNTIME_DIR}"
+DBUS_SOCK="${XDG_RUNTIME_DIR}/bus"
+rm -f "${DBUS_SOCK}"
+su - "${APP_USER}" -c "XDG_RUNTIME_DIR='${XDG_RUNTIME_DIR}' dbus-daemon --session --address='unix:path=${DBUS_SOCK}' --fork"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=${DBUS_SOCK}"
+echo "DBus started at ${DBUS_SESSION_BUS_ADDRESS}"
+echo
+
 
 echo "Configuring hosts file for ad blocking..."
 wc -l /app/hosts
-sudo tee -a /etc/hosts < /app/hosts > /dev/null
+cat /app/hosts >> /etc/hosts
+echo
 
 echo "Starting tinyproxy on port 8119..."
 tinyproxy -d -c /app/tinyproxy.conf &
 for i in {1..5}; do
-    sleep 2
-    if curl -x http://127.0.0.1:8119 ip.fly.dev; then
-        echo "Tinyproxy is up and running"
-        break
-    fi
-    echo "Proxy check: attempt $i failed, retrying in 2 seconds..."
+  sleep 2
+  if curl -x http://127.0.0.1:8119 ip.fly.dev; then
+    echo "Tinyproxy is up and running"
+    break
+  fi
+  echo "Proxy check: attempt $i failed, retrying in 2 seconds..."
 done
+echo
 
 echo "Starting XFCE4..."
-startxfce4 >/dev/null 2>&1 & sleep 3
+su - "${APP_USER}" -c "DISPLAY=${DISPLAY} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR} DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS} startxfce4 >/dev/null 2>&1 &"
+sleep 3
 
-xeyes &
+su - "${APP_USER}" -c "DISPLAY=${DISPLAY} xeyes &"
 
-chromium --start-maximized --no-sandbox --remote-debugging-port=9221 --disable-dev-shm-usage --proxy-server="http://127.0.0.1:8119" duck.com &
+echo "Starting Chromium..."
+su - "${APP_USER}" -c "DISPLAY=${DISPLAY} \
+  chromium --start-maximized --no-sandbox --remote-debugging-port=9221 \
+  --disable-dev-shm-usage --proxy-server='http://127.0.0.1:8119' duck.com &"
+
 socat TCP-LISTEN:9222,fork,reuseaddr TCP:127.0.0.1:9221 &
 
+echo "Starting noVNC on port 80 (root)..."
+websockify --web /usr/share/novnc/ 80 localhost:5900 &
+
 echo "VNC server started on port 5900"
-sudo websockify --web /usr/share/novnc/ 80 localhost:5900 &
 echo "noVNC viewable at http://localhost:80"
 
-export GTK_THEME="Windows-10"
-echo "Installing desktop theme..."
-if [ ! -d ~/.themes/Windows-10 ] && [ ! -f ~/.themes/*/index.theme ]; then
-    echo "Theme not found, extracting from Theme.tar.gz..."
-
-    mkdir -p /tmp/win10-theme
-    tar xz -C /tmp/win10-theme --strip-components=1 < /app/Theme.tar.gz
-
-    mkdir -p ~/.themes/Windows-10
-    cp -r /tmp/win10-theme/* ~/.themes/Windows-10/
-    echo "Copied theme files to ~/.themes/Windows-10/"    
-    rm -rf /tmp/win10-theme
-
-    echo "Applying theme settings..."
-    xfconf-query -c xsettings -p /Net/ThemeName -s "$GTK_THEME" --create --type string
-    xfconf-query -c xfwm4 -p /general/theme -s "$GTK_THEME" --create --type string
-    xfconf-query -c xsettings -p /Gtk/ThemeName -s "$GTK_THEME" --create --type string
-    gtk-update-icon-cache -f ~/.themes/$GTK_THEME/gtk-*/icons 2>/dev/null || true
-
-    echo "Removing the dock panel..."
-    xfconf-query -c xfce4-panel -p /panels -s 1 --create --type int
-
-    echo "Repositioning the main panel and taskbar to the bottom edge..."
-    xfconf-query -c xfce4-panel -p /panels/panel-1/position -s "p=10;x=0;y=0" --create --type string
-
-    echo "Restarting XFCE to apply new theme..."
-    pkill -f xfsettingsd 2>/dev/null || true; sleep 1; DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS xfsettingsd &
-    pkill -f xfwm4 2>/dev/null || true; sleep 1; DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS xfwm4 --replace &
-    pkill -f xfce4-panel 2>/dev/null || true; sleep 1; DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS xfce4-panel &
-    sleep 2
-
-    echo "Desktop theme installed!"
-else
-    echo "Theme already exists, skipping installation"
-fi
-
-# Keep the container running
+# Keep the container running 
 while true; do sleep 1; done
